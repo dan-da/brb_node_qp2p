@@ -330,13 +330,14 @@ impl Repl {
     }
 }
 
-#[derive(Debug)]
+//#[derive(Debug)]
 struct Router {
     state: SharedBRB,
     qp2p: QuicP2p,
     addr: SocketAddr,
     endpoint: SharedEndpoint,
     peers: HashMap<Actor, SocketAddr>,
+    lastconn: HashMap<SocketAddr, (Connection, IncomingMessages)>,    
     unacked_packets: VecDeque<Packet>,
 }
 
@@ -390,6 +391,7 @@ impl Router {
             addr,
             endpoint: endpoint.clone(), 
             peers: Default::default(),
+            lastconn: Default::default(),
             unacked_packets: Default::default(),
         };
 
@@ -431,27 +433,29 @@ impl Router {
         }
     }
 
-    async fn deliver_network_msg(&self, network_msg: &NetworkMsg, dest_addr: &SocketAddr) {
+    async fn deliver_network_msg(&mut self, network_msg: &NetworkMsg, dest_addr: &SocketAddr) {
         let msg = bincode::serialize(&network_msg).unwrap();
     //    let endpoint = self.new_endpoint();
-        println!("opening connection to {}", dest_addr);
+
+        if let Some(conn) = self.endpoint.get_connection(&dest_addr).await {
+            println!("using existing connection to {}", dest_addr);
+            match conn.send_bi(msg.into()).await {
+                Ok((_send, _recv)) => info!("[P2P] Sent network msg successfully."),
+                Err(e) => error!("[P2P] Failed to send network msg: {:?}", e),
+            }
+//            self.lastconn.insert(dest_addr.clone(), conn);
+            return;
+        }
+
+        println!("opening new connection to {}", dest_addr);
         match self.endpoint.connect_to(&dest_addr).await {
-            Ok((conn, _)) => {
+            Ok((conn, msgs)) => {
                 println!("conn opened");
-                match conn.open_bi().await {
-                    Ok((mut send, _recv)) => {
-                        info!("[P2P] Opened connection successfully.");
-                        println!("open_bi ok");
-                        match send.send_user_msg(msg.into()).await {
-                            Ok(_) => info!("[P2P] Sent network msg successfully."),
-                            Err(e) => error!("[P2P] Failed to send network msg: {:?}", e),
-                        }
-                    } 
-                    Err(e) => {
-                        println!("open_bi not ok");
-                        error!("[P2P] Failed to open connection: {:?}", e)
-                    },
+                match conn.send_bi(msg.into()).await {
+                    Ok((_send, _recv)) => info!("[P2P] Sent network msg successfully."),
+                    Err(e) => error!("[P2P] Failed to send network msg: {:?}", e),
                 }
+                self.lastconn.insert(dest_addr.clone(), (conn, msgs.unwrap()));
 //                conn.close();
             }
             Err(err) => {
@@ -465,7 +469,7 @@ impl Router {
     }
 
     async fn deliver_packet(&mut self, packet: Packet) {
-        match self.peers.get(&packet.dest) {
+        match self.peers.clone().get(&packet.dest) {
             Some(peer_addr) => {
                 info!(
                     "[P2P] delivering packet to {:?} at addr {:?}: {:?}",
@@ -494,7 +498,7 @@ impl Router {
                 }
             }
             RouterCmd::Debug => {
-                debug!("{:#?}", self);
+//                debug!("{:#?}", self);
             }
             RouterCmd::AntiEntropy(actor_id) => {
                 if let Some(actor) = self.resolve_actor(&actor_id) {
@@ -568,7 +572,7 @@ impl Router {
             {
                 #[allow(clippy::map_entry)]
                 if !self.peers.contains_key(&actor) {
-                    for (peer_actor, peer_addr) in self.peers.iter() {
+                    for (peer_actor, peer_addr) in self.peers.clone().iter() {
                         self.deliver_network_msg(&NetworkMsg::Peer(*peer_actor, *peer_addr), &addr)
                             .await;
                     }
@@ -583,7 +587,7 @@ impl Router {
                     self.deliver_packet(packet).await;
                 }
 
-                if let Some(peer_addr) = self.peers.get(&op_packet.source) {
+                if let Some(peer_addr) = self.peers.clone().get(&op_packet.source) {
                     info!(
                         "[P2P] delivering Ack(packet) to {:?} at addr {:?}: {:?}",
                         op_packet.dest, peer_addr, op_packet
@@ -624,26 +628,36 @@ async fn listen_for_network_msgs(endpoint: SharedEndpoint, mut router_tx: mpsc::
 
     let mut conns = endpoint.listen().await;
     println!("Listen returned");
-    while let Some(mut msgs) = conns.next().await {
+    while let Some(msgs) = conns.next().await {
         println!("Got incoming messages");
-        while let Some(msg) = msgs.next().await {
-            println!("Received message: {:?}", msg);
-            let net_msg: NetworkMsg = bincode::deserialize(&msg.get_message_data()).unwrap();
-            let cmd = match net_msg {
-                NetworkMsg::Peer(actor, addr) => RouterCmd::AddPeer(actor, addr),
-                NetworkMsg::Packet(packet) => RouterCmd::Apply(packet),
-                NetworkMsg::Ack(packet) => RouterCmd::Acked(packet),
-            };
-
-            router_tx
-                .send(cmd)
-                .await
-                .expect("Failed to send router command");
-        }
+        tokio::spawn(handle_incoming_messages(router_tx.clone(), msgs));
     }
 
     info!("[P2P] Finished listening for connections");
 }
+
+async fn handle_incoming_messages(mut router_tx: mpsc::Sender<RouterCmd>, mut msgs: IncomingMessages) {
+    println!("in handle thread");
+
+    while let Some(msg) = msgs.next().await {
+        println!("Received msg {:?}", msg);
+
+        let net_msg: NetworkMsg = bincode::deserialize(&msg.get_message_data()).unwrap();
+        let cmd = match net_msg {
+            NetworkMsg::Peer(actor, addr) => RouterCmd::AddPeer(actor, addr),
+            NetworkMsg::Packet(packet) => RouterCmd::Apply(packet),
+            NetworkMsg::Ack(packet) => RouterCmd::Acked(packet),
+        };
+
+        router_tx
+            .send(cmd)
+            .await
+            .expect("Failed to send router command");
+    }
+
+    println!("finished handle thread");
+}
+
 
 #[tokio::main]
 async fn main() {
@@ -653,7 +667,7 @@ async fn main() {
     env_logger::Builder::from_env(
         env_logger::Env::default()
 //            .default_filter_or("brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,qp2p=trace,quinn=warn"),
-            .default_filter_or("brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,qp2p=info,quinn=warn"),
+            .default_filter_or("brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,qp2p=info,quinn=info"),
     )
 //    .format(|buf, record| writeln!(buf, "{}\n", record.args()))
     .init();
