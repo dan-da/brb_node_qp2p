@@ -9,7 +9,7 @@ use cmdr::*;
 use log::{debug, error, info, warn};
 //use std::io::Write;
 
-use qp2p::{self, Config, Endpoint, QuicP2p, Connection, IncomingMessages, IncomingConnections};
+use qp2p::{self, Config, Connection, Endpoint, IncomingConnections, IncomingMessages, QuicP2p};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -124,7 +124,6 @@ struct SharedEndpoint {
     endpoint: Arc<sync::Mutex<Endpoint>>,
 }
 
-
 impl SharedEndpoint {
     fn new(e: Endpoint) -> Self {
         Self {
@@ -136,11 +135,15 @@ impl SharedEndpoint {
         self.endpoint.lock().await.socket_addr().await
     }
 
+    #[allow(dead_code)]
     pub async fn get_connection(&self, peer_addr: &SocketAddr) -> Option<Connection> {
         self.endpoint.lock().await.get_connection(peer_addr)
     }
 
-    pub async fn connect_to(&self, node_addr: &SocketAddr) -> qp2p::Result<(Connection, Option<IncomingMessages>)> {
+    pub async fn connect_to(
+        &self,
+        node_addr: &SocketAddr,
+    ) -> qp2p::Result<(Connection, Option<IncomingMessages>)> {
         self.endpoint.lock().await.connect_to(node_addr).await
     }
 
@@ -148,11 +151,11 @@ impl SharedEndpoint {
         self.endpoint.lock().await.listen()
     }
 
+    #[allow(dead_code)]
     pub async fn close(&self) {
         self.endpoint.lock().await.close()
     }
 }
-
 
 #[derive(Debug)]
 struct Repl {
@@ -333,11 +336,10 @@ impl Repl {
 //#[derive(Debug)]
 struct Router {
     state: SharedBRB,
-    qp2p: QuicP2p,
     addr: SocketAddr,
     endpoint: SharedEndpoint,
     peers: HashMap<Actor, SocketAddr>,
-    lastconn: HashMap<SocketAddr, (Connection, IncomingMessages)>,    
+    lastconn: HashMap<SocketAddr, Connection>,
     unacked_packets: VecDeque<Packet>,
 }
 
@@ -387,9 +389,8 @@ impl Router {
 
         let router = Self {
             state,
-            qp2p,
             addr,
-            endpoint: endpoint.clone(), 
+            endpoint: endpoint.clone(),
             peers: Default::default(),
             lastconn: Default::default(),
             unacked_packets: Default::default(),
@@ -398,11 +399,11 @@ impl Router {
         (router, endpoint)
     }
 
-/*    
-    fn new_endpoint(&self) -> Endpoint {
-        self.qp2p.new_endpoint().expect("Failed to create endpoint")
-    }
-*/    
+    /*
+        fn new_endpoint(&self) -> Endpoint {
+            self.qp2p.new_endpoint().expect("Failed to create endpoint")
+        }
+    */
 
     fn resolve_actor(&self, actor_id: &str) -> Option<Actor> {
         let matching_actors: Vec<Actor> = self
@@ -435,28 +436,16 @@ impl Router {
 
     async fn deliver_network_msg(&mut self, network_msg: &NetworkMsg, dest_addr: &SocketAddr) {
         let msg = bincode::serialize(&network_msg).unwrap();
-    //    let endpoint = self.new_endpoint();
-
-        if let Some(conn) = self.endpoint.get_connection(&dest_addr).await {
-            println!("using existing connection to {}", dest_addr);
-            match conn.send_bi(msg.into()).await {
-                Ok((_send, _recv)) => info!("[P2P] Sent network msg successfully."),
-                Err(e) => error!("[P2P] Failed to send network msg: {:?}", e),
-            }
-//            self.lastconn.insert(dest_addr.clone(), conn);
-            return;
-        }
 
         println!("opening new connection to {}", dest_addr);
         match self.endpoint.connect_to(&dest_addr).await {
-            Ok((conn, msgs)) => {
+            Ok((conn, _msgs)) => {
                 println!("conn opened");
                 match conn.send_bi(msg.into()).await {
                     Ok((_send, _recv)) => info!("[P2P] Sent network msg successfully."),
                     Err(e) => error!("[P2P] Failed to send network msg: {:?}", e),
                 }
-                self.lastconn.insert(dest_addr.clone(), (conn, msgs.unwrap()));
-//                conn.close();
+                self.lastconn.insert(*dest_addr, conn);
             }
             Err(err) => {
                 println!("conn not opened");
@@ -498,7 +487,7 @@ impl Router {
                 }
             }
             RouterCmd::Debug => {
-//                debug!("{:#?}", self);
+                //                debug!("{:#?}", self);
             }
             RouterCmd::AntiEntropy(actor_id) => {
                 if let Some(actor) = self.resolve_actor(&actor_id) {
@@ -636,7 +625,10 @@ async fn listen_for_network_msgs(endpoint: SharedEndpoint, mut router_tx: mpsc::
     info!("[P2P] Finished listening for connections");
 }
 
-async fn handle_incoming_messages(mut router_tx: mpsc::Sender<RouterCmd>, mut msgs: IncomingMessages) {
+async fn handle_incoming_messages(
+    mut router_tx: mpsc::Sender<RouterCmd>,
+    mut msgs: IncomingMessages,
+) {
     println!("in handle thread");
 
     while let Some(msg) = msgs.next().await {
@@ -657,7 +649,6 @@ async fn handle_incoming_messages(mut router_tx: mpsc::Sender<RouterCmd>, mut ms
 
     println!("finished handle thread");
 }
-
 
 #[tokio::main]
 async fn main() {
