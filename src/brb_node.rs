@@ -12,6 +12,7 @@ use log::{debug, error, info, warn};
 use qp2p::{self, Config, Connection, Endpoint, IncomingConnections, IncomingMessages, QuicP2p};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
@@ -333,14 +334,24 @@ impl Repl {
     }
 }
 
-//#[derive(Debug)]
+#[derive(Debug)]
 struct Router {
     state: SharedBRB,
     addr: SocketAddr,
     endpoint: SharedEndpoint,
     peers: HashMap<Actor, SocketAddr>,
-    lastconn: HashMap<SocketAddr, Connection>,
+    lastconn: HashMap<SocketAddr, MyConnection>,
     unacked_packets: VecDeque<Packet>,
+}
+
+struct MyConnection(Connection);
+
+impl fmt::Debug for MyConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("remote_address", &self.0.remote_address())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -445,7 +456,7 @@ impl Router {
                     Ok((_send, _recv)) => info!("[P2P] Sent network msg successfully."),
                     Err(e) => error!("[P2P] Failed to send network msg: {:?}", e),
                 }
-                self.lastconn.insert(*dest_addr, conn);
+                self.lastconn.insert(*dest_addr, MyConnection(conn));
             }
             Err(err) => {
                 println!("conn not opened");
@@ -487,7 +498,7 @@ impl Router {
                 }
             }
             RouterCmd::Debug => {
-                //                debug!("{:#?}", self);
+                debug!("{:#?}", self);
             }
             RouterCmd::AntiEntropy(actor_id) => {
                 if let Some(actor) = self.resolve_actor(&actor_id) {
@@ -658,7 +669,7 @@ async fn main() {
     env_logger::Builder::from_env(
         env_logger::Env::default()
 //            .default_filter_or("brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,qp2p=trace,quinn=warn"),
-            .default_filter_or("brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,qp2p=info,quinn=info"),
+            .default_filter_or("brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,qp2p=warn,quinn=warn"),
     )
 //    .format(|buf, record| writeln!(buf, "{}\n", record.args()))
     .init();
